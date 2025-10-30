@@ -1,216 +1,311 @@
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
-#include <errno.h>
 
-// Types
-typedef uint64_t u64;
-typedef uint32_t u32;
-typedef uint8_t  u8;
+#define PHY_INFO_MAGIC 0xaa55a5a5
+#define PHY_INFO_SIZE 0x8000
+#define MBR_OFFSET 0x200
+#define MAX_PARTITIONS 96
 
-// Constants from boot0.h
-#define TOC_MAIN_INFO_MAGIC   0x89119800U
-#define TOC_MAIN_INFO_END     0x3b45494dU
-#define TOC_ITEM_INFO_END     0x3b454949U
+// NAND Partition structure (36 bytes)
+typedef struct __attribute__((packed)) {
+    char classname[16];      // Partition name
+    uint32_t addr;           // Start address in sectors
+    uint32_t len;            // Length in sectors
+    uint32_t user_type;      // User type
+    uint32_t keydata;        // Key data flag
+    uint32_t ro;             // Read-only flag
+} nand_partition_t;
 
-// Structs (exact from boot0.h)
-typedef struct sbrom_toc1_head_info
-{
-    char name[16];
-    u32  magic;
-    u32  add_sum;
-    u32  serial_num;
-    u32  status;
-    u32  items_nr;
-    u32  valid_len;
-    u32  main_version;
-    u32  sub_version;
-    u32  reserved[3];
-    u32  end;
-} sbrom_toc1_head_info_t;
+// MBR structure embedded in boot_info
+typedef struct __attribute__((packed)) {
+    uint32_t crc;            // CRC32
+    uint32_t part_count;     // Number of partitions
+    nand_partition_t array[MAX_PARTITIONS];
+} partition_mbr_t;
 
-typedef struct sbrom_toc1_item_info
-{
-    char name[64];
-    u32  data_offset;
-    u32  data_len;
-    u32  encrypt;
-    u32  type;
-    u32  run_addr;
-    u32  index;
-    u32  reserved[69];
-    u32  end;
-} sbrom_toc1_item_info_t;
+// Boot info header (first few fields)
+typedef struct __attribute__((packed)) {
+    uint32_t magic;          // PHY_INFO_MAGIC = 0xaa55a5a5
+    uint32_t len;            // PHY_INFO_SIZE = 0x8000
+    uint32_t sum;            // Checksum
+} boot_info_header_t;
 
-// Helper: safe string copy
-static void safe_strcpy(char *dst, const char *src, size_t len) {
-    memcpy(dst, src, len - 1);
-    dst[len - 1] = '\0';
+void print_partition(const nand_partition_t *part, int index) {
+    char name[17] = {0};
+    memcpy(name, part->classname, 16);
+
+    // Calculate sizes
+    uint64_t start_bytes = (uint64_t)part->addr * 512;
+    uint64_t size_bytes = (uint64_t)part->len * 512;
+    double size_mb = size_bytes / (1024.0 * 1024.0);
+
+    printf("Partition %2d: %-16s\n", index, name);
+    printf("  Start (sectors):  0x%08x (%u)\n", part->addr, part->addr);
+    printf("  Start (bytes):    0x%08llx (%llu)\n",
+           (unsigned long long)start_bytes, (unsigned long long)start_bytes);
+    printf("  Length (sectors): 0x%08x (%u)\n", part->len, part->len);
+    printf("  Size (bytes):     0x%08llx (%llu)\n",
+           (unsigned long long)size_bytes, (unsigned long long)size_bytes);
+    printf("  Size (MB):        %.2f\n", size_mb);
+    printf("  User type:        0x%08x\n", part->user_type);
+    printf("  Key data:         %u\n", part->keydata);
+    printf("  Read-only:        %u\n", part->ro);
+    printf("\n");
 }
 
-// Helper: get suffix based on type
-const char* get_type_suffix(u32 type) {
-    switch (type) {
-        case 1: return ".keycert";
-        case 2: return ".signcert";
-        case 3: return ""; // binary
-        default: return ".data";
+int is_printable_name(const char *name, int len) {
+    int printable_count = 0;
+    for (int i = 0; i < len && name[i] != '\0'; i++) {
+        if ((name[i] >= 'a' && name[i] <= 'z') ||
+            (name[i] >= 'A' && name[i] <= 'Z') ||
+            (name[i] >= '0' && name[i] <= '9') ||
+            name[i] == '_' || name[i] == '-') {
+            printable_count++;
+        }
     }
+    return printable_count > 0; // At least one valid char
 }
 
-int main(int argc, char *argv[])
-{
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <nand_dump.bin>\n", argv[0]);
-        return 1;
+int validate_candidate(FILE *fp, long offset, uint32_t *part_count_out) {
+    // Read boot_info header
+    fseek(fp, offset, SEEK_SET);
+    boot_info_header_t header;
+    if (fread(&header, sizeof(header), 1, fp) != 1) {
+        return 0;
     }
 
-    FILE *dump = fopen(argv[1], "rb");
-    if (!dump) {
-        perror("fopen dump");
-        return 1;
+    // Validate magic (should be already checked, but double-check)
+    if (header.magic != PHY_INFO_MAGIC) {
+        return 0;
+    }
+
+    // Validate length field
+    if (header.len != PHY_INFO_SIZE) {
+        return 0;
+    }
+
+    // Seek to MBR
+    long mbr_offset = offset + MBR_OFFSET;
+    fseek(fp, mbr_offset, SEEK_SET);
+
+    uint32_t crc, part_count;
+    if (fread(&crc, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&part_count, sizeof(uint32_t), 1, fp) != 1) {
+        return 0;
+    }
+
+    // Validate partition count
+    if (part_count == 0 || part_count > MAX_PARTITIONS) {
+        return 0;
+    }
+
+    // Read first partition to validate
+    nand_partition_t first_part;
+    if (fread(&first_part, sizeof(nand_partition_t), 1, fp) != 1) {
+        return 0;
+    }
+
+    // Check if first partition has reasonable values
+    if (!is_printable_name(first_part.classname, 16)) {
+        return 0;
+    }
+
+    // Partition should have non-zero length (usually)
+    if (first_part.len == 0 && first_part.addr == 0) {
+        return 0;
+    }
+
+    *part_count_out = part_count;
+    return 1;
+}
+
+int search_all_candidates(FILE *fp, long **offsets_out, int *count_out) {
+    uint32_t magic;
+    long pos = 0;
+    long file_size;
+    int capacity = 10;
+    int count = 0;
+    long *offsets = malloc(capacity * sizeof(long));
+
+    if (!offsets) {
+        return 0;
     }
 
     // Get file size
-    if (fseek(dump, 0, SEEK_END) != 0) {
-        perror("fseek end");
-        fclose(dump);
-        return 1;
-    }
-    long file_size = ftell(dump);
-    if (file_size < (long)sizeof(sbrom_toc1_head_info_t)) {
-        fprintf(stderr, "File too small to contain TOC1\n");
-        fclose(dump);
-        return 1;
-    }
-    rewind(dump);
+    fseek(fp, 0, SEEK_END);
+    file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
 
-    printf("Scanning NAND dump (%ld bytes) for TOC1 headers...\n", file_size);
+    printf("Scanning %ld bytes for PHY_INFO_MAGIC candidates...\n", file_size);
 
-    // Buffer for header
-    sbrom_toc1_head_info_t head;
-    long offset = 0;
-    int toc_index = 0;
+    // Search for all occurrences of PHY_INFO_MAGIC
+    while (pos < file_size - sizeof(uint32_t)) {
+        fseek(fp, pos, SEEK_SET);
+        if (fread(&magic, sizeof(uint32_t), 1, fp) != 1) {
+            break;
+        }
 
-    // Search every 4-byte aligned position (TOC1 is 4-byte aligned)
-    while (offset <= file_size - (long)sizeof(sbrom_toc1_head_info_t)) {
-        if (fseek(dump, offset, SEEK_SET) != 0) break;
-        if (fread(&head, sizeof(head), 1, dump) != 1) break;
+        if (magic == PHY_INFO_MAGIC) {
+            uint32_t part_count;
+            printf("  Found magic at offset 0x%08lx (%ld) ... ", pos, pos);
 
-        // Check magic and name
-        if (head.magic == TOC_MAIN_INFO_MAGIC) {
-            char name[17];
-            safe_strcpy(name, head.name, sizeof(name));
-            if (strcmp(name, "sunxi-secure") == 0) {
-                printf("\n[+] Found TOC1 at offset 0x%08lx\n", offset);
-                printf("    items_nr = %u, valid_len = %u, version = %u.%u\n",
-                       head.items_nr, head.valid_len, head.main_version, head.sub_version);
+            if (validate_candidate(fp, pos, &part_count)) {
+                printf("VALID (partitions: %u)\n", part_count);
 
-                if (head.end != TOC_MAIN_INFO_END) {
-                    printf("    [!] Warning: Invalid header end marker\n");
-                }
-
-                if (head.items_nr == 0 || head.items_nr > 1024) {
-                    printf("    [!] Suspicious item count: %u — skipping\n", head.items_nr);
-                    offset += 4;
-                    continue;
-                }
-
-                // Allocate items
-                size_t items_size = head.items_nr * sizeof(sbrom_toc1_item_info_t);
-                if (offset + sizeof(head) + items_size > (size_t)file_size) {
-                    printf("    [!] Not enough data for %u items — skipping\n", head.items_nr);
-                    offset += 4;
-                    continue;
-                }
-
-                sbrom_toc1_item_info_t *items = malloc(items_size);
-                if (!items) {
-                    perror("malloc items");
-                    offset += 4;
-                    continue;
-                }
-
-                if (fseek(dump, offset + sizeof(head), SEEK_SET) != 0 ||
-                    fread(items, items_size, 1, dump) != 1) {
-                    printf("    [!] Failed to read items — skipping\n");
-                    free(items);
-                    offset += 4;
-                    continue;
-                }
-
-                // Process each item
-                for (u32 i = 0; i < head.items_nr; i++) {
-                    sbrom_toc1_item_info_t *item = &items[i];
-
-                    if (item->data_len == 0) continue;
-
-                    // Validate data_offset is within file
-                    if (item->data_offset >= (u32)file_size ||
-                        (u64)item->data_offset + item->data_len > (u64)file_size) {
-                        printf("    [!] Item '%.64s': data out of bounds — skipping\n", item->name);
-                        continue;
-                    }
-
-                    char item_name[65];
-                    safe_strcpy(item_name, item->name, sizeof(item_name));
-                    const char *suffix = get_type_suffix(item->type);
-
-                    // Unique filename: toc_<index>_<name><suffix>.bin
-                    char out_filename[256];
-                    snprintf(out_filename, sizeof(out_filename),
-                             "toc_%d_%s%s.bin", toc_index, item_name, suffix);
-
-                    FILE *out = fopen(out_filename, "wb");
-                    if (!out) {
-                        printf("    [!] Cannot create '%s' — skipping\n", out_filename);
-                        continue;
-                    }
-
-                    // Seek and read data
-                    if (fseek(dump, item->data_offset, SEEK_SET) != 0) {
-                        fclose(out);
-                        continue;
-                    }
-
-                    size_t total = 0;
-                    size_t remaining = item->data_len;
-                    char buffer[65536];
-
-                    while (remaining > 0) {
-                        size_t to_read = (remaining > sizeof(buffer)) ? sizeof(buffer) : remaining;
-                        size_t n = fread(buffer, 1, to_read, dump);
-                        if (n != to_read) break;
-                        fwrite(buffer, 1, n, out);
-                        total += n;
-                        remaining -= n;
-                    }
-
-                    fclose(out);
-                    printf("    → Extracted %zu bytes to: %s\n", total, out_filename);
-
-                    if (item->encrypt) {
-                        printf("      !! Encrypted (AES) — output is ciphertext\n");
+                // Add to array
+                if (count >= capacity) {
+                    capacity *= 2;
+                    offsets = realloc(offsets, capacity * sizeof(long));
+                    if (!offsets) {
+                        return 0;
                     }
                 }
-
-                free(items);
-                toc_index++;
-                // Skip ahead by valid_len if reasonable, else just +4
-                if (head.valid_len > sizeof(head) && head.valid_len < 16 * 1024 * 1024) {
-                    offset += head.valid_len;
-                } else {
-                    offset += 4;
-                }
-                continue;
+                offsets[count++] = pos;
+            } else {
+                printf("invalid\n");
             }
         }
 
-        offset += 4; // Search every 4 bytes (TOC1 is 4-byte aligned)
+        pos += 4; // Move by 4 bytes for alignment
     }
 
-    printf("\nScan complete. Found %d TOC1 instance(s).\n", toc_index);
-    fclose(dump);
+    *offsets_out = offsets;
+    *count_out = count;
+    return 1;
+}
+
+int parse_and_print_partitions(FILE *fp, long offset) {
+    // Read boot_info header
+    fseek(fp, offset, SEEK_SET);
+    boot_info_header_t header;
+    if (fread(&header, sizeof(header), 1, fp) != 1) {
+        fprintf(stderr, "Error reading boot_info header\n");
+        return 0;
+    }
+
+    printf("\nBoot Info Header:\n");
+    printf("  Magic:    0x%08x\n", header.magic);
+    printf("  Length:   0x%08x (%u bytes)\n", header.len, header.len);
+    printf("  Checksum: 0x%08x\n", header.sum);
+    printf("\n");
+
+    // Seek to MBR structure
+    long mbr_offset = offset + MBR_OFFSET;
+    fseek(fp, mbr_offset, SEEK_SET);
+
+    // Read MBR header
+    uint32_t crc, part_count;
+    if (fread(&crc, sizeof(uint32_t), 1, fp) != 1 ||
+        fread(&part_count, sizeof(uint32_t), 1, fp) != 1) {
+        fprintf(stderr, "Error reading MBR header\n");
+        return 0;
+    }
+
+    printf("Partition Table (MBR) at offset 0x%08lx:\n", mbr_offset);
+    printf("  CRC32:           0x%08x\n", crc);
+    printf("  Partition Count: %u\n", part_count);
+    printf("\n");
+
+    printf("=== Partition List ===\n\n");
+
+    // Read and display each partition
+    for (uint32_t i = 0; i < part_count; i++) {
+        nand_partition_t part;
+        if (fread(&part, sizeof(nand_partition_t), 1, fp) != 1) {
+            fprintf(stderr, "Error reading partition %u\n", i);
+            break;
+        }
+
+        // Skip empty partitions
+        if (part.addr == 0 && part.len == 0 && part.classname[0] == '\0') {
+            continue;
+        }
+
+        print_partition(&part, i);
+    }
+
+    printf("=== Summary ===\n");
+    printf("Total partitions: %u\n", part_count);
+    printf("PHY_INFO offset:  0x%08lx\n", offset);
+    printf("MBR offset:       0x%08lx\n", mbr_offset);
+
+    return 1;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <nand_dump_file> [candidate_index]\n", argv[0]);
+        fprintf(stderr, "\nThis tool parses Allwinner NAND partition tables.\n");
+        fprintf(stderr, "It searches for all PHY_INFO structures and validates them.\n");
+        fprintf(stderr, "\nIf multiple valid candidates are found:\n");
+        fprintf(stderr, "  - Without [candidate_index]: shows the first valid one\n");
+        fprintf(stderr, "  - With [candidate_index]: shows the specified candidate (0-based)\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(argv[1], "rb");
+    if (!fp) {
+        perror("Error opening file");
+        return 1;
+    }
+
+    // Search for all valid candidates
+    long *offsets = NULL;
+    int count = 0;
+
+    if (!search_all_candidates(fp, &offsets, &count)) {
+        fprintf(stderr, "Error during search\n");
+        fclose(fp);
+        return 1;
+    }
+
+    printf("\nFound %d valid PHY_INFO candidate(s)\n", count);
+
+    if (count == 0) {
+        fprintf(stderr, "\nNo valid partition tables found!\n");
+        fprintf(stderr, "This could mean:\n");
+        fprintf(stderr, "  - The dump is corrupted\n");
+        fprintf(stderr, "  - The partition table uses a different format\n");
+        fprintf(stderr, "  - The magic bytes are present but data is invalid\n");
+        free(offsets);
+        fclose(fp);
+        return 1;
+    }
+
+    // Determine which candidate to display
+    int candidate_index = 0;
+    if (argc >= 3) {
+        candidate_index = atoi(argv[2]);
+        if (candidate_index < 0 || candidate_index >= count) {
+            fprintf(stderr, "Invalid candidate index %d (must be 0-%d)\n",
+                    candidate_index, count - 1);
+            free(offsets);
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    if (count > 1) {
+        printf("\n=== Using candidate %d of %d ===\n", candidate_index, count);
+        printf("(Run with argument '%d' through '%d' to view other candidates)\n\n",
+               0, count - 1);
+    }
+
+    printf("\n============================================\n");
+    printf("Parsing PHY_INFO at offset: 0x%08lx (%ld)\n",
+           offsets[candidate_index], offsets[candidate_index]);
+    printf("============================================\n");
+
+    if (!parse_and_print_partitions(fp, offsets[candidate_index])) {
+        free(offsets);
+        fclose(fp);
+        return 1;
+    }
+
+    free(offsets);
+    fclose(fp);
+
     return 0;
 }
